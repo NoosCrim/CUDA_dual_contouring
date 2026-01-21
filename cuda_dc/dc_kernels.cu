@@ -130,7 +130,9 @@ inline __device__ void add_hermite_to_qef(
     }
 }
 
-__global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __restrict__ density_data, const ActiveData* __restrict__ active_data, const uint32_t* __restrict__ active_index_map, vert_t* __restrict__ vertices, uint32_t* __restrict__ indices)
+__global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __restrict__ density_data, 
+    const ActiveData* __restrict__ active_data, const uint32_t* __restrict__ active_index_map, 
+    vert_t* __restrict__ vertices, uint32_t* __restrict__ indices)
 { 
     // gen vertices using QEF minimization
     // All QEF math is done in GRID SPACE (0 to size), then transformed to world space at the end
@@ -442,7 +444,7 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
 
 // Thread-coarsened version: each thread processes a 2x2x2 block of voxels.
 // This reduces memory traffic by reusing density values at shared corners.
-// A 2x2x2 block needs 3x3x3 = 27 density values (instead of 8*8 = 64 without reuse).
+// A 2x2x2 block needs 3x3x3 = 27 density values.
 __global__ void gen_active_data(uint32_t size, const density_t* __restrict__ density_data, ActiveData *active_data, uint32_t *active_index_map)
 {
     extern __shared__ uint32_t temp[];
