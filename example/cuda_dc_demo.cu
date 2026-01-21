@@ -32,15 +32,16 @@ static void GLAPIENTRY gl_error_callback(
 
 // All density/gradient functors work in normalized <0,1> range for all axes
 
+constexpr float __device__ __constant__ sphere_r = 0.35f;
 struct sphereDensityFunctor
 {
     cuda_dc::density_t __device__ operator()(cuda_dc::vec3_t v, cuda_dc::density_t prev)
     {
         (void)prev;
         // Sphere centered at (0.5, 0.5, 0.5) with radius 0.45
-        constexpr float radius = 0.45f;
+        
         cuda_dc::vec3_t center{0.5f, 0.5f, 0.5f};
-        return (v - center).lenSqr() / (radius * radius) - 1.0f;
+        return (v - center).lenSqr() / (sphere_r * sphere_r) - 1.0f;
     }
 };
 struct sphereGradientFunctor
@@ -56,9 +57,9 @@ struct sphereGradientFunctor
 // Cube with sphere cut out from one corner - demonstrates edge preservation
 // The cube has sharp edges, and the sphere cutout creates a smooth curved surface
 // Dual contouring should preserve both the sharp cube edges AND the smooth sphere surface
-static constexpr float __device__ __host__ __constant__ cube_size = 0.6f;
-static constexpr float __device__ __host__ __constant__ cutout_radius = 0.45f;
-static constexpr cuda_dc::vec3_t __device__ __host__ __constant__ cutout_center = 
+static constexpr float __device__ __constant__ cube_size = 0.7f;
+static constexpr float __device__ __constant__ cutout_radius = 0.45f;
+static constexpr cuda_dc::vec3_t __device__ __constant__ cutout_center = 
     cuda_dc::vec3_t{1,1,1} * (1.0f - 0.5f * (1.f - cube_size));
 struct cubeSphereCutoutDensityFunctor
 {

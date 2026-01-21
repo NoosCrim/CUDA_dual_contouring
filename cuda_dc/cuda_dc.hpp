@@ -329,17 +329,13 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
 
     cudaEventElapsedTime(&milli, start, stop);
 
-    density_t *density_data_host = new density_t[grid_size_cubed];
-    
-    cudaMemcpy(density_data_host, density_data_device, sizeof(density_t) * grid_size_cubed, cudaMemcpyDeviceToHost);
-
 
     ActiveData *active_voxels_device;
     uint32_t *active_index_map;
     checkCudaErrors(cudaMalloc(&active_voxels_device, sizeof(ActiveData) + sizeof(ActiveVoxel) * grid_size_cubed));
     checkCudaErrors(cudaMemset(active_voxels_device, 0, sizeof(ActiveData)));  // Initialize counters to 0
     checkCudaErrors(cudaMalloc(&active_index_map, sizeof(uint32_t) * grid_size_cubed));
-    unsigned long long num_threads_2 = 512;
+    unsigned long long num_threads_2 = 256;
     unsigned long long num_blocks_2 = (grid_size_cubed + num_threads_2 - 1) / num_threads_2;
     unsigned long long shared_mem_size = 33*sizeof(uint32_t);
 
@@ -366,19 +362,12 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
     cudaEventElapsedTime(&milli, start, stop);
     printf("Active data kernel execution time: %f ms\n", milli);
 
-    ActiveData *active_voxels_host = (ActiveData*)malloc(sizeof(ActiveData) + sizeof(ActiveVoxel) * grid_size_cubed);
-    cudaMemcpy(active_voxels_host, active_voxels_device, sizeof(ActiveData) + sizeof(ActiveVoxel) * grid_size_cubed, cudaMemcpyDeviceToHost);
-    cudaMemcpy(density_data_host, density_data_device, sizeof(density_t) * grid_size_cubed, cudaMemcpyDeviceToHost);
-    printf("Active voxels: %u\n", active_voxels_host->active_voxel_n);
-    /*for(unsigned int i = 0; i < active_voxels_host->active_voxel_n; i++)
-    {
-        vec_t<uint32_t, 3> voxelId = from_morton(active_voxels_host->data[i].morton);
-        printf("{%u, 0x%02X, 0x%03X: (%u, %u, %u)} ", i, active_voxels_host->data[i].corner_case, edge_case_map[active_voxels_host->data[i].corner_case], voxelId[0], voxelId[1], voxelId[2]);
-    }*/
-    putchar('\n');
+    ActiveData active_voxels_host;
+    cudaMemcpy(&active_voxels_host, active_voxels_device, sizeof(ActiveData), cudaMemcpyDeviceToHost);
+    printf("Active voxels: %u\n", active_voxels_host.active_voxel_n);
 
     unsigned long long num_threads_3 = 512;
-    unsigned long long num_blocks_3 = (active_voxels_host->active_voxel_n + num_threads_3 - 1) / num_threads_3;
+    unsigned long long num_blocks_3 = (active_voxels_host.active_voxel_n + num_threads_3 - 1) / num_threads_3;
     if(num_blocks_3 == 0) num_blocks_3 = 1;
     // Shared memory: 33 words (same as gen_active_data)
     unsigned long long shared_mem_size_3 = 33 * sizeof(uint32_t);
@@ -405,12 +394,12 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
     cudaEventElapsedTime(&milli, start, stop);
     printf("Gradient kernel execution time: %f ms\n", milli);
 
-    cudaMemcpy(active_voxels_host, active_voxels_device, sizeof(ActiveData) + sizeof(ActiveVoxel) * grid_size_cubed, cudaMemcpyDeviceToHost);
-    unsigned long long vertexCount = active_voxels_host->vertex_n;
-    unsigned long long indexCount = active_voxels_host->geometry_edge_n * 6llu;
-    unsigned long long hermiteCount = active_voxels_host->active_edge_n;
+    cudaMemcpy(&active_voxels_host, active_voxels_device, sizeof(ActiveData), cudaMemcpyDeviceToHost);
+    unsigned long long vertexCount = active_voxels_host.vertex_n;
+    unsigned long long indexCount = active_voxels_host.geometry_edge_n * 6llu;
+    unsigned long long hermiteCount = active_voxels_host.active_edge_n;
 
-    printf("vertexCount: %llu, indexCount: %llu, hermiteCount: %llu, activeVoxels: %u\n", vertexCount, indexCount, hermiteCount, active_voxels_host->active_voxel_n);
+    printf("vertexCount: %llu, indexCount: %llu, hermiteCount: %llu\n", vertexCount, indexCount, hermiteCount);
 
 
     vert_t *verts_device;
@@ -419,7 +408,7 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
     checkCudaErrors(cudaMalloc(&idxs_device, indexCount * sizeof(uint32_t)));
 
     unsigned long long num_threads_4 = 1024;
-    unsigned long long num_blocks_4 = (active_voxels_host->active_voxel_n + num_threads_4 - 1) / num_threads_4;
+    unsigned long long num_blocks_4 = (active_voxels_host.active_voxel_n + num_threads_4 - 1) / num_threads_4;
     if(num_blocks_4 == 0) num_blocks_4 = 1;
     printf("\nLaunching mesh kernel: %llu blocks, %llu threads\n", num_blocks_4, num_threads_4);
 
@@ -457,8 +446,6 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
     cudaFree(verts_device);
     cudaFree(idxs_device);
     cudaDeviceSynchronize();
-    delete[] density_data_host;
-    free(active_voxels_host);
     return outMesh;
 }
 
