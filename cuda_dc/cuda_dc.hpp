@@ -294,7 +294,7 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
 template<DensityFunctor F1, GradientFunctor F2>
 Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_size, float mesh_size = 2.0f)
 {
-    float milli = 0.0f;
+    float milli = 0.0f, milli_total = 0.0f;
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -312,8 +312,6 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
     
     cudaEventRecord(stop);
     
-    printf("Density kernel execution time: %f ms\n", milli);
-    
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
@@ -328,6 +326,8 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
     }
 
     cudaEventElapsedTime(&milli, start, stop);
+    milli_total += milli;
+    printf("Density kernel execution time: %f ms\n", milli);
 
 
     ActiveData *active_voxels_device;
@@ -360,6 +360,7 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
     }
 
     cudaEventElapsedTime(&milli, start, stop);
+    milli_total += milli;
     printf("Active data kernel execution time: %f ms\n", milli);
 
     ActiveData active_voxels_host;
@@ -392,6 +393,7 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
     }
 
     cudaEventElapsedTime(&milli, start, stop);
+    milli_total += milli;
     printf("Gradient kernel execution time: %f ms\n", milli);
 
     cudaMemcpy(&active_voxels_host, active_voxels_device, sizeof(ActiveData), cudaMemcpyDeviceToHost);
@@ -433,9 +435,11 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
     }
 
     cudaEventElapsedTime(&milli, start, stop);
+    milli_total += milli;
     printf("Mesh kernel execution time: %f ms\n", milli);
 
     puts("\nMesh generation successful!\n\n");
+    printf("Total compute time: %f ms\n\n", milli_total);
     Mesh outMesh{vertexCount, indexCount};
     checkCudaErrors(cudaMemcpy(outMesh.verts, verts_device, vertexCount * sizeof(vert_t), cudaMemcpyDeviceToHost));
     checkCudaErrors(cudaMemcpy(outMesh.indices, idxs_device, indexCount * sizeof(uint32_t), cudaMemcpyDeviceToHost));
