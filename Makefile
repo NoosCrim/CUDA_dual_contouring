@@ -15,11 +15,13 @@ GLEW_LIB := -lGLEW
 GLFW_LIB := -lglfw
 RENDERER_LIB := ./renderer/out/renderer/librenderer.a
 
-.PHONY: run_example example cuda_dc renderer $(RENDERER_LIB)
+.PHONY: run_example example cuda_dc renderer $(RENDERER_LIB) all
 DEPS := $(shell find $(DEP) -name "*.d" 2>/dev/null)
 ifneq ($(DEPS),)
 include $(DEPS)
 endif
+
+all: example cuda_dc renderer
 
 CUDA_DC_OBJ := $(patsubst %.cu,$(OBJ)%.ou,$(wildcard cuda_dc/*.cu)) $(patsubst %.cpp,$(OBJ)%.o,$(wildcard cuda_dc/*.cpp))
 CUDA_DC_LIB := $(OUT)cuda_dc/cuda_dc.a
@@ -59,3 +61,7 @@ $(OBJ)%.o : %.cpp
 $(OBJ)%.ou : %.cu
 	@mkdir -p $(dir $(DEP)$*.o) $(dir $@)
 	$(CUDA) -c $< -o $@ $(CUDA_FLAGS) -MMD -MP -MF $(DEP)$*.d
+
+clean:
+	rm -rf $(OUT)
+	cd renderer && make clean
