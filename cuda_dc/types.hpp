@@ -7,24 +7,26 @@
 #define __device__
 #endif
 
-inline constexpr unsigned int opt_align(unsigned int size)
+namespace cuda_dc{
+
+inline constexpr unsigned int opt_align(unsigned int align_of)
 {
-    if(size>>4)
+    if(align_of>>4)
         return 16;
-    if(size>>3)
+    if(align_of>>3)
         return 8;
-    if(size>>2)
+    if(align_of>>2)
         return 4;
-    if(size>>1)
+    if(align_of>>1)
         return 2;
     return 1;
 }
 
 template<typename T, unsigned int N>
-struct alignas( opt_align( opt_align( sizeof(T) ) * N)) vec_t
+struct /*alignas( opt_align( opt_align( alignof(T) ) * N))*/ vec_t
 {
 private:
-    alignas(opt_align(sizeof(T))) T _v[N];
+    /*alignas(opt_align(alignof(T)))*/ T _v[N];
 public:
     constexpr inline __host__ __device__ vec_t(): _v{} {}
     template<typename... ARGS>
@@ -64,7 +66,7 @@ public:
     constexpr inline __host__ __device__ vec_t<T, N>& operator=(const vec_t<T2, N2> &other)
     {
         #pragma unroll
-        for(int i = 0; i < N & i < N2; i++)
+        for(int i = 0; i < N && i < N2; i++)
             _v[i] = (T)other[i];
         
         return *this;
@@ -194,7 +196,7 @@ constexpr inline __host__ __device__ vec_t<T,N> operator/(const vec_t<T,N> &v, T
 }
 
 template<typename T, typename T2, unsigned int N>
-constexpr inline __host__ __device__ vec_t<T,N> operator*(T2 s, const vec_t<T2,N> &v)
+constexpr inline __host__ __device__ vec_t<T,N> operator*(T2 s, const vec_t<T,N> &v)
 {
     vec_t<T,N> out;
     #pragma unroll
@@ -259,7 +261,7 @@ constexpr inline __host__ __device__ vec_t<uint32_t, 3> from_morton(uint32_t v)
 }
 
 using density_t = float;
-using density_compressed_t = uint8_t;
+using density_compressed_t = int8_t;
 using vec3_t = vec_t<float,3>;
 using gradient_t = vec3_t;
 
@@ -269,19 +271,69 @@ using hermite_compressed_t = vec_t<uint8_t, 3>;
 
 constexpr inline density_compressed_t __host__ __device__ density_encode(density_t v)
 {
-    return v < 0.f ? 0 : (v > 1.f ? (density_compressed_t)-1 : ((density_compressed_t)-1)*v);
+    return v * 128.f;
 }
 
 constexpr inline density_t __host__ __device__ density_decode(density_compressed_t v)
 {
-    return ((density_t)v) / (density_compressed_t)-1;
+    return ((float)v) / 128.f;
 }
 
+struct vert_t
+{
+    vec3_t pos;//, normal;
+};
+
+struct Mesh
+{
+private:
+    uint64_t verts_n = 0, indices_n = 0;
+public:
+    vert_t *verts = nullptr;
+    uint32_t *indices = nullptr;
+    Mesh(){}
+    Mesh(uint64_t _verts_n, uint64_t _indices_n):
+        verts_n(_verts_n),
+        indices_n(_indices_n),
+        verts(new vert_t[_verts_n]),
+        indices(new uint32_t[_indices_n])
+    {
+
+    }
+    Mesh(const Mesh&) = delete;
+    Mesh(Mesh&& other):
+        verts_n(other.verts_n),
+        indices_n(other.indices_n),
+        verts(other.verts),
+        indices(other.indices)
+    {
+        other.verts_n = 0;
+        other.indices_n = 0;
+        other.verts = nullptr;
+        other.indices = nullptr;
+
+    }
+    ~Mesh()
+    {
+        delete[] verts;
+        delete[] indices;
+    }
+    uint64_t index_count()
+    {
+        return indices_n;
+    }
+    uint64_t vertex_count()
+    {
+        return verts_n;
+    }
+};
 template<typename F>
-concept DensityFunction = requires(F f, vec3_t p, density_t prev_v) {
+concept DensityFunctor = requires(F f, vec3_t p, density_t prev_v) {
     { f(p, prev_v) } -> std::same_as<density_t>;
 };
 template<typename F>
-concept GradientFunction = requires(F f, vec3_t p, gradient_t prev_v) {
-    { f(p, prev_v) } -> std::same_as<gradient_t>;
+concept GradientFunctor = requires(F f, vec3_t p) {
+    { f(p) } -> std::same_as<gradient_t>;
 };
+
+} // namespace cuda_dc
