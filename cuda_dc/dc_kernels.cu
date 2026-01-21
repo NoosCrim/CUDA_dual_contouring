@@ -3,146 +3,15 @@
 #include <cstdio>
 namespace cuda_dc
 {
-// stage 2 kernel generating active voxels list
-__global__ void gen_active_data(uint32_t size, const density_t* __restrict__ density_data, ActiveData *active_data, uint32_t *active_index_map)
-{
-    extern  __shared__  uint32_t temp[];
-    const uint32_t morton = threadIdx.x + blockIdx.x * blockDim.x;
-    const uint32_t laneId = threadIdx.x % 32;
-    const uint32_t warpId = threadIdx.x / 32;
-
-    vec_t<uint32_t, 3> voxelID = from_morton(morton);
-    bool hasUnder0 = false, hasOver0 = false;
-    uint8_t corner_case = 0u;
-
-    density_t original_density = density_data[morton];
-
-    if(morton < size * size * size)
-    {
-        density_t sample = original_density;
-        // we store density at [morton] because we replace it later
-        // and we want to put it back later
-        hasUnder0 = hasUnder0 || sample <= 0;
-        hasOver0 = hasOver0 || sample > 0;
-        corner_case = sample <= 0;
-        if(voxelID[0] < size - 1)
-        {
-            sample = density_data[to_morton(voxelID + vec_t<uint32_t, 3>{1,0,0})];
-            hasUnder0 = hasUnder0 || sample <= 0;
-            hasOver0 = hasOver0 || sample > 0;
-            corner_case = corner_case | ((sample <= 0) << 1);
-        }
-        if(voxelID[1] < size - 1)
-        {
-            sample = density_data[to_morton(voxelID + vec_t<uint32_t, 3>{0,1,0})];
-            hasUnder0 = hasUnder0 || sample <= 0;
-            hasOver0 = hasOver0 || sample > 0;
-            corner_case = corner_case | ((sample <= 0) << 2);
-
-            if(voxelID[0] < size - 1)
-            {
-                sample = density_data[to_morton(voxelID + vec_t<uint32_t, 3>{1,1,0})];
-                hasUnder0 = hasUnder0 || sample <= 0;
-                hasOver0 = hasOver0 || sample > 0;
-                corner_case = corner_case | ((sample <= 0) << 3);
-            }
-        }
-        
-        if(voxelID[2] + 1 < size)
-        {
-            sample = density_data[to_morton(voxelID + vec_t<uint32_t, 3>{0,0,1})];
-            hasUnder0 = hasUnder0 || sample <= 0;
-            hasOver0 = hasOver0 || sample > 0;
-            corner_case = corner_case | ((sample <= 0) << 4);
-
-            if(voxelID[0] + 1 < size)
-            {
-                sample = density_data[to_morton(voxelID + vec_t<uint32_t, 3>{1,0,1})];
-                hasUnder0 = hasUnder0 || sample <= 0;
-                hasOver0 = hasOver0 || sample > 0;
-                corner_case = corner_case | ((sample <= 0) << 5);
-            }
-            if(voxelID[1] + 1 < size)
-            {
-                sample = density_data[to_morton(voxelID + vec_t<uint32_t, 3>{0,1,1})];
-                hasUnder0 = hasUnder0 || sample <= 0;
-                hasOver0 = hasOver0 || sample > 0;
-                corner_case = corner_case | ((sample <= 0) << 6);
-
-                if(voxelID[0] + 1 < size)
-                {
-                    sample = density_data[to_morton(voxelID + vec_t<uint32_t, 3>{1,1,1})];
-                    hasUnder0 = hasUnder0 || sample <= 0;
-                    hasOver0 = hasOver0 || sample > 0;
-                    corner_case = corner_case | ((sample <= 0) << 7);
-                }
-            }
-        }
-    }
-
-    bool isActive = hasOver0 && hasUnder0;
-
-    // 1st in-warp reduction
-    uint32_t activeInWarpMap = __ballot_sync(0xFFFFFFFF, isActive);
-    uint32_t inWarpOffset = __popc(activeInWarpMap << (32 - laneId));
-    uint32_t activeInWarp = __popc(activeInWarpMap);
-    
-    // prepare values for 2nd reduction
-    if(threadIdx.x%32 == 0) temp[threadIdx.x/32] = activeInWarp;
-
-    // sync before 2nd reduction
-    __syncthreads();
-    
-    if(warpId == 0)
-    {
-        // read values for 2nd reduction
-        uint32_t activeInWarpPrefixSum = 0;
-        if(threadIdx.x < blockDim.x/32)
-            activeInWarpPrefixSum = temp[threadIdx.x];
-
-        // 2nd in-warp reduction
-        // calculates exclusive prefix sums of activeInWarp
-        #pragma unroll
-        for (int offset = 1; offset < 32; offset <<= 1)
-        {
-            uint32_t n = __shfl_up_sync(0xffffffff, activeInWarpPrefixSum, offset);
-            if (laneId >= offset) activeInWarpPrefixSum += n;
-        }
-        temp[laneId] = activeInWarpPrefixSum;
-    }
-    __syncthreads();
-    
-
-    // add amount of active voxels in block to total
-    // store write offset for block to shared memory
-    // only last thread in first warp has total sum
-    if(threadIdx.x == 31)
-        temp[32] = atomicAdd(&active_data->active_voxel_n, temp[31]);
-
-    // sync to ensure temp[0] is valid
-    __syncthreads();
-    
-    // add block write offset to writeIdx, giving final writeIdx
-    // add 1 as offset because 1st value is amount of active voxels
-    // results in final writeIdx
-    uint32_t writeIdx = temp[32] + inWarpOffset + (temp[warpId] - activeInWarp);
-
-    if(isActive)
-    {
-        active_data->data[writeIdx].morton = morton;
-        active_data->data[writeIdx].corner_case = corner_case;
-        active_index_map[morton] = writeIdx;
-    }
-}
 
 // stage 4 generating vertices and indices
 
-// QEF solver for 3x3 symmetric matrix with adaptive regularization toward mass point
-// Solves (AᵀA + λI)x = Aᵀb + λ*mass_point where λ is adaptively increased if needed
-// Works in grid space (coordinates 0 to size)
+// QEF solver for 3x3 symmetric matrix with adaptive regularization toward mass point.
+// Solves (A'A + lambda*I)x = A'b + lambda*mass_point, increasing lambda if needed.
+// Works in grid space (coordinates 0 to size).
 __device__ vec3_t solve_qef_biased(
-    float ata[6],      // Upper triangular of AᵀA: [a00, a01, a02, a11, a12, a22]
-    vec3_t atb,        // Aᵀb vector
+    float ata[6],      // Upper triangular of A'A: [a00, a01, a02, a11, a12, a22]
+    vec3_t atb,        // A'b vector
     vec3_t mass_point, // Bias point (centroid of hermite points) in grid space
     vec3_t voxel_min,  // Voxel bounds min in grid space
     vec3_t voxel_max,  // Voxel bounds max in grid space
@@ -165,12 +34,12 @@ __device__ vec3_t solve_qef_biased(
     vec3_t result;
     for(int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt)
     {
-        // Add regularization: (AᵀA + λI)
+        // Add regularization: (A'A + lambda*I)
         float a00 = ata[0] + scaled_bias, a01 = ata[1], a02 = ata[2];
         float a11 = ata[3] + scaled_bias, a12 = ata[4];
         float a22 = ata[5] + scaled_bias;
         
-        // Bias Aᵀb toward mass_point: Aᵀb + λ*mass_point
+        // Bias A'b toward mass_point: A'b + lambda*mass_point
         vec3_t b;
         b[0] = atb[0] + scaled_bias * mass_point[0];
         b[1] = atb[1] + scaled_bias * mass_point[1];
@@ -200,7 +69,7 @@ __device__ vec3_t solve_qef_biased(
         float inv12 = (a02 * a01 - a00 * a12) * inv_det;
         float inv22 = (a00 * a11 - a01 * a01) * inv_det;
         
-        // Solve: x = (AᵀA + λI)⁻¹ * (Aᵀb + λ*mass_point)
+        // Solve: x = (A'A + lambda*I)^-1 * (A'b + lambda*mass_point)
         result[0] = inv00 * b[0] + inv01 * b[1] + inv02 * b[2];
         result[1] = inv01 * b[0] + inv11 * b[1] + inv12 * b[2];
         result[2] = inv02 * b[0] + inv12 * b[1] + inv22 * b[2];
@@ -242,7 +111,7 @@ inline __device__ void add_hermite_to_qef(
     {
         n = n / len;
         
-        // Add to AᵀA (outer product of normal)
+        // Add to A'A (outer product of normal)
         ata[0] += n[0] * n[0];
         ata[1] += n[0] * n[1];
         ata[2] += n[0] * n[2];
@@ -250,7 +119,7 @@ inline __device__ void add_hermite_to_qef(
         ata[4] += n[1] * n[2];
         ata[5] += n[2] * n[2];
         
-        // Add to Aᵀb: n * (n · p)
+        // Add to A'b: n * dot(n, p)
         float d = n[0] * p[0] + n[1] * p[1] + n[2] * p[2];
         atb[0] += n[0] * d;
         atb[1] += n[1] * d;
@@ -277,6 +146,14 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
         uint16_t edge_case = edge_case_map[corner_case];
 
         vec_t<uint32_t, 3> voxelID = from_morton(morton);
+        
+        // Precompute neighbor Morton codes using fast increments
+        uint32_t m_x = morton_inc_x(morton);      // +X
+        uint32_t m_y = morton_inc_y(morton);      // +Y
+        uint32_t m_z = morton_inc_z(morton);      // +Z
+        uint32_t m_xy = morton_inc_y(m_x);        // +X+Y
+        uint32_t m_xz = morton_inc_z(m_x);        // +X+Z
+        uint32_t m_yz = morton_inc_z(m_y);        // +Y+Z
         
         // Voxel bounds in GRID SPACE
         vec3_t voxel_min_grid = vec3_t(voxelID);
@@ -321,7 +198,7 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
         // Edge 3: {1,0,0} -> {1,1,0} - owned by neighbor at +X (their edge 1)
         if((edge_case & (1u << 3)) && voxelID[0] < size - 1)
         {
-            uint32_t neighbor_idx = active_index_map[to_morton(voxelID + vec_t<uint32_t, 3>{1,0,0})];
+            uint32_t neighbor_idx = active_index_map[m_x];
             add_hermite_to_qef(
                 active_data->data[neighbor_idx].hermite_data[1].point,
                 active_data->data[neighbor_idx].hermite_data[1].gradient,
@@ -332,7 +209,7 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
         // Edge 4: {1,0,0} -> {1,0,1} - owned by neighbor at +X (their edge 2)
         if((edge_case & (1u << 4)) && voxelID[0] < size - 1)
         {
-            uint32_t neighbor_idx = active_index_map[to_morton(voxelID + vec_t<uint32_t, 3>{1,0,0})];
+            uint32_t neighbor_idx = active_index_map[m_x];
             add_hermite_to_qef(
                 active_data->data[neighbor_idx].hermite_data[2].point,
                 active_data->data[neighbor_idx].hermite_data[2].gradient,
@@ -343,7 +220,7 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
         // Edge 5: {0,1,0} -> {1,1,0} - owned by neighbor at +Y (their edge 0)
         if((edge_case & (1u << 5)) && voxelID[1] < size - 1)
         {
-            uint32_t neighbor_idx = active_index_map[to_morton(voxelID + vec_t<uint32_t, 3>{0,1,0})];
+            uint32_t neighbor_idx = active_index_map[m_y];
             add_hermite_to_qef(
                 active_data->data[neighbor_idx].hermite_data[0].point,
                 active_data->data[neighbor_idx].hermite_data[0].gradient,
@@ -354,7 +231,7 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
         // Edge 6: {0,1,0} -> {0,1,1} - owned by neighbor at +Y (their edge 2)
         if((edge_case & (1u << 6)) && voxelID[1] < size - 1)
         {
-            uint32_t neighbor_idx = active_index_map[to_morton(voxelID + vec_t<uint32_t, 3>{0,1,0})];
+            uint32_t neighbor_idx = active_index_map[m_y];
             add_hermite_to_qef(
                 active_data->data[neighbor_idx].hermite_data[2].point,
                 active_data->data[neighbor_idx].hermite_data[2].gradient,
@@ -365,7 +242,7 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
         // Edge 7: {0,0,1} -> {1,0,1} - owned by neighbor at +Z (their edge 0)
         if((edge_case & (1u << 7)) && voxelID[2] < size - 1)
         {
-            uint32_t neighbor_idx = active_index_map[to_morton(voxelID + vec_t<uint32_t, 3>{0,0,1})];
+            uint32_t neighbor_idx = active_index_map[m_z];
             add_hermite_to_qef(
                 active_data->data[neighbor_idx].hermite_data[0].point,
                 active_data->data[neighbor_idx].hermite_data[0].gradient,
@@ -376,7 +253,7 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
         // Edge 8: {0,0,1} -> {0,1,1} - owned by neighbor at +Z (their edge 1)
         if((edge_case & (1u << 8)) && voxelID[2] < size - 1)
         {
-            uint32_t neighbor_idx = active_index_map[to_morton(voxelID + vec_t<uint32_t, 3>{0,0,1})];
+            uint32_t neighbor_idx = active_index_map[m_z];
             add_hermite_to_qef(
                 active_data->data[neighbor_idx].hermite_data[1].point,
                 active_data->data[neighbor_idx].hermite_data[1].gradient,
@@ -387,7 +264,7 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
         // Edge 9: {1,1,0} -> {1,1,1} - owned by neighbor at +X+Y (their edge 2)
         if((edge_case & (1u << 9)) && voxelID[0] < size - 1 && voxelID[1] < size - 1)
         {
-            uint32_t neighbor_idx = active_index_map[to_morton(voxelID + vec_t<uint32_t, 3>{1,1,0})];
+            uint32_t neighbor_idx = active_index_map[m_xy];
             add_hermite_to_qef(
                 active_data->data[neighbor_idx].hermite_data[2].point,
                 active_data->data[neighbor_idx].hermite_data[2].gradient,
@@ -398,7 +275,7 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
         // Edge 10: {1,0,1} -> {1,1,1} - owned by neighbor at +X+Z (their edge 1)
         if((edge_case & (1u << 10)) && voxelID[0] < size - 1 && voxelID[2] < size - 1)
         {
-            uint32_t neighbor_idx = active_index_map[to_morton(voxelID + vec_t<uint32_t, 3>{1,0,1})];
+            uint32_t neighbor_idx = active_index_map[m_xz];
             add_hermite_to_qef(
                 active_data->data[neighbor_idx].hermite_data[1].point,
                 active_data->data[neighbor_idx].hermite_data[1].gradient,
@@ -409,7 +286,7 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
         // Edge 11: {0,1,1} -> {1,1,1} - owned by neighbor at +Y+Z (their edge 0)
         if((edge_case & (1u << 11)) && voxelID[1] < size - 1 && voxelID[2] < size - 1)
         {
-            uint32_t neighbor_idx = active_index_map[to_morton(voxelID + vec_t<uint32_t, 3>{0,1,1})];
+            uint32_t neighbor_idx = active_index_map[m_yz];
             add_hermite_to_qef(
                 active_data->data[neighbor_idx].hermite_data[0].point,
                 active_data->data[neighbor_idx].hermite_data[0].gradient,
@@ -454,19 +331,23 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
 
         vec_t<uint32_t, 3> voxelID = from_morton(morton);
         
+        // Precompute neighbor Morton codes for -1 offsets
+        uint32_t m_ny = morton_dec_y(morton);     // -Y
+        uint32_t m_nz = morton_dec_z(morton);     // -Z
+        uint32_t m_nx = morton_dec_x(morton);     // -X
+        uint32_t m_nynz = morton_dec_z(m_ny);     // -Y-Z
+        uint32_t m_nxnz = morton_dec_z(m_nx);     // -X-Z
+        uint32_t m_nxny = morton_dec_y(m_nx);     // -X-Y
+        
         // Edge 0: X-direction edge creates quad in YZ plane
         // The 4 voxels sharing this edge are at: {0,0,0}, {0,-1,0}, {0,-1,-1}, {0,0,-1}
         // So we need voxelID[1] > 0 and voxelID[2] > 0
         // Also need all 4 voxels to have valid vertices (all coords < size-1)
         if(voxelID[0] < size - 1 && voxelID[1] > 0 && voxelID[1] < size - 1 && voxelID[2] > 0 && voxelID[2] < size - 1 && (edge_case & (1u << 0)))
         {
-            vec_t<uint32_t, 3> v1 = {voxelID[0], voxelID[1] - 1, voxelID[2]};
-            vec_t<uint32_t, 3> v2 = {voxelID[0], voxelID[1] - 1, voxelID[2] - 1};
-            vec_t<uint32_t, 3> v3 = {voxelID[0], voxelID[1], voxelID[2] - 1};
-            
-            uint32_t vi1 = active_data->data[active_index_map[to_morton(v1)]].vertex_idx;
-            uint32_t vi2 = active_data->data[active_index_map[to_morton(v2)]].vertex_idx;
-            uint32_t vi3 = active_data->data[active_index_map[to_morton(v3)]].vertex_idx;
+            uint32_t vi1 = active_data->data[active_index_map[m_ny]].vertex_idx;      // {0,-1,0}
+            uint32_t vi2 = active_data->data[active_index_map[m_nynz]].vertex_idx;    // {0,-1,-1}
+            uint32_t vi3 = active_data->data[active_index_map[m_nz]].vertex_idx;      // {0,0,-1}
             
             if(density_data[morton] < 0)
             {
@@ -496,13 +377,9 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
         // Also need all 4 voxels to have valid vertices (all coords < size-1)
         if(voxelID[0] > 0 && voxelID[0] < size - 1 && voxelID[1] < size - 1 && voxelID[2] > 0 && voxelID[2] < size - 1 && (edge_case & (1u << 1)))
         {
-            vec_t<uint32_t, 3> v1 = {voxelID[0], voxelID[1], voxelID[2] - 1};
-            vec_t<uint32_t, 3> v2 = {voxelID[0] - 1, voxelID[1], voxelID[2] - 1};
-            vec_t<uint32_t, 3> v3 = {voxelID[0] - 1, voxelID[1], voxelID[2]};
-            
-            uint32_t vi1 = active_data->data[active_index_map[to_morton(v1)]].vertex_idx;
-            uint32_t vi2 = active_data->data[active_index_map[to_morton(v2)]].vertex_idx;
-            uint32_t vi3 = active_data->data[active_index_map[to_morton(v3)]].vertex_idx;
+            uint32_t vi1 = active_data->data[active_index_map[m_nz]].vertex_idx;      // {0,0,-1}
+            uint32_t vi2 = active_data->data[active_index_map[m_nxnz]].vertex_idx;    // {-1,0,-1}
+            uint32_t vi3 = active_data->data[active_index_map[m_nx]].vertex_idx;      // {-1,0,0}
             
             if(density_data[morton] < 0)
             {
@@ -532,13 +409,9 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
         // Also need all 4 voxels to have valid vertices (all coords < size-1)
         if(voxelID[0] > 0 && voxelID[0] < size - 1 && voxelID[1] > 0 && voxelID[1] < size - 1 && voxelID[2] < size - 1 && (edge_case & (1u << 2)))
         {
-            vec_t<uint32_t, 3> v1 = {voxelID[0] - 1, voxelID[1], voxelID[2]};
-            vec_t<uint32_t, 3> v2 = {voxelID[0] - 1, voxelID[1] - 1, voxelID[2]};
-            vec_t<uint32_t, 3> v3 = {voxelID[0], voxelID[1] - 1, voxelID[2]};
-            
-            uint32_t vi1 = active_data->data[active_index_map[to_morton(v1)]].vertex_idx;
-            uint32_t vi2 = active_data->data[active_index_map[to_morton(v2)]].vertex_idx;
-            uint32_t vi3 = active_data->data[active_index_map[to_morton(v3)]].vertex_idx;
+            uint32_t vi1 = active_data->data[active_index_map[m_nx]].vertex_idx;      // {-1,0,0}
+            uint32_t vi2 = active_data->data[active_index_map[m_nxny]].vertex_idx;    // {-1,-1,0}
+            uint32_t vi3 = active_data->data[active_index_map[m_ny]].vertex_idx;      // {0,-1,0}
             
             if(density_data[morton] < 0)
             {
@@ -565,6 +438,313 @@ __global__ void gen_mesh(uint32_t size, float voxel_size, const density_t* __res
     }
     
     
+}
+
+// Thread-coarsened version: each thread processes a 2x2x2 block of voxels.
+// This reduces memory traffic by reusing density values at shared corners.
+// A 2x2x2 block needs 3x3x3 = 27 density values (instead of 8*8 = 64 without reuse).
+__global__ void gen_active_data(uint32_t size, const density_t* __restrict__ density_data, ActiveData *active_data, uint32_t *active_index_map)
+{
+    extern __shared__ uint32_t temp[];
+    
+    const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+    const uint32_t laneId = threadIdx.x % 32;
+    const uint32_t warpId = threadIdx.x / 32;
+    
+    // Each thread processes a 2x2x2 block of voxels
+    // Block base position in grid coordinates (multiply by 2)
+    const uint32_t half_size = size / 2;
+    const uint32_t half_size_cubed = half_size * half_size * half_size;
+    
+    // Results for up to 8 voxels per thread
+    uint8_t corner_cases[8] = {0};
+    uint32_t mortons[8];
+    uint8_t active_mask = 0;  // Bitmask of which voxels are active
+    int active_count = 0;
+    
+    if(tid < half_size_cubed)
+    {
+        // Get block base position from Morton code at half resolution
+        vec_t<uint32_t, 3> blockBase = from_morton(tid);
+        blockBase[0] *= 2;
+        blockBase[1] *= 2;
+        blockBase[2] *= 2;
+        
+        // Check if entire 2x2x2 block is interior (no boundary voxels)
+        bool blockInterior = (blockBase[0] + 2 <= size - 1) && 
+                             (blockBase[1] + 2 <= size - 1) && 
+                             (blockBase[2] + 2 <= size - 1);
+        
+        // Load 3x3x3 = 27 density values for the block (if interior)
+        // Layout: d[z][y][x] where each dimension is 0,1,2
+        density_t d[3][3][3];
+        bool signs[3][3][3];
+        
+        if(blockInterior)
+        {
+            // Compute base Morton code for the block
+            uint32_t m_base = to_morton(blockBase);
+            
+            // Load all 27 densities using Morton increments.
+            // We build Morton codes for each row start (x=0), then walk along x.
+            // row_start[z][y] holds the Morton code for position (0, y, z) relative to blockBase.
+            
+            uint32_t row_start[3][3];
+            
+            // Build row starts for z=0 plane
+            row_start[0][0] = m_base;
+            row_start[0][1] = morton_inc_y(m_base);
+            row_start[0][2] = morton_inc_y(row_start[0][1]);
+            
+            // Build row starts for z=1 and z=2 planes
+            #pragma unroll
+            for(int y = 0; y < 3; y++)
+            {
+                row_start[1][y] = morton_inc_z(row_start[0][y]);
+                row_start[2][y] = morton_inc_z(row_start[1][y]);
+            }
+            
+            // Load densities by walking along x for each row
+            #pragma unroll
+            for(int z = 0; z < 3; z++)
+            {
+                #pragma unroll
+                for(int y = 0; y < 3; y++)
+                {
+                    uint32_t m = row_start[z][y];
+                    d[z][y][0] = density_data[m];
+                    m = morton_inc_x(m);
+                    d[z][y][1] = density_data[m];
+                    d[z][y][2] = density_data[morton_inc_x(m)];
+                }
+            }
+            
+            // Compute signs
+            #pragma unroll
+            for(int z = 0; z < 3; z++)
+                #pragma unroll
+                for(int y = 0; y < 3; y++)
+                    #pragma unroll
+                    for(int x = 0; x < 3; x++)
+                        signs[z][y][x] = d[z][y][x] <= 0;
+            
+            // Process 8 voxels in the 2x2x2 block
+            // Voxel (0,0,0) at blockBase
+            #pragma unroll
+            for(int vz = 0; vz < 2; vz++)
+            {
+                #pragma unroll
+                for(int vy = 0; vy < 2; vy++)
+                {
+                    #pragma unroll
+                    for(int vx = 0; vx < 2; vx++)
+                    {
+                        int vidx = vx + vy * 2 + vz * 4;
+                        vec_t<uint32_t, 3> voxelPos = blockBase + vec_t<uint32_t, 3>{(uint32_t)vx, (uint32_t)vy, (uint32_t)vz};
+                        mortons[vidx] = to_morton(voxelPos);
+                        
+                        // Build corner case from 8 corners of this voxel
+                        uint8_t cc = 0;
+                        cc |= signs[vz  ][vy  ][vx  ] << 0;  // corner 0
+                        cc |= signs[vz  ][vy  ][vx+1] << 1;  // corner 1
+                        cc |= signs[vz  ][vy+1][vx  ] << 2;  // corner 2
+                        cc |= signs[vz  ][vy+1][vx+1] << 3;  // corner 3
+                        cc |= signs[vz+1][vy  ][vx  ] << 4;  // corner 4
+                        cc |= signs[vz+1][vy  ][vx+1] << 5;  // corner 5
+                        cc |= signs[vz+1][vy+1][vx  ] << 6;  // corner 6
+                        cc |= signs[vz+1][vy+1][vx+1] << 7;  // corner 7
+                        
+                        corner_cases[vidx] = cc;
+                        
+                        // Active if not all same sign
+                        bool isActive = (cc != 0) && (cc != 255);
+                        if(isActive)
+                        {
+                            active_mask |= (1u << vidx);
+                            active_count++;
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Handle boundary blocks - fall back to per-voxel processing
+            #pragma unroll
+            for(int vz = 0; vz < 2; vz++)
+            {
+                #pragma unroll
+                for(int vy = 0; vy < 2; vy++)
+                {
+                    #pragma unroll
+                    for(int vx = 0; vx < 2; vx++)
+                    {
+                        int vidx = vx + vy * 2 + vz * 4;
+                        vec_t<uint32_t, 3> voxelPos = blockBase + vec_t<uint32_t, 3>{(uint32_t)vx, (uint32_t)vy, (uint32_t)vz};
+                        
+                        // Skip if outside grid
+                        if(voxelPos[0] >= size || voxelPos[1] >= size || voxelPos[2] >= size)
+                            continue;
+                        
+                        uint32_t morton = to_morton(voxelPos);
+                        mortons[vidx] = morton;
+                        
+                        bool atBoundary = (voxelPos[0] >= size - 1) || (voxelPos[1] >= size - 1) || (voxelPos[2] >= size - 1);
+                        
+                        density_t s0 = density_data[morton];
+                        bool sign0 = s0 <= 0;
+                        uint8_t cc = sign0;
+                        
+                        if(!atBoundary)
+                        {
+                            // Can load all 8 corners
+                            uint32_t m100 = morton_inc_x(morton);
+                            uint32_t m010 = morton_inc_y(morton);
+                            uint32_t m110 = morton_inc_x(m010);
+                            uint32_t m001 = morton_inc_z(morton);
+                            uint32_t m101 = morton_inc_x(m001);
+                            uint32_t m011 = morton_inc_y(m001);
+                            uint32_t m111 = morton_inc_x(m011);
+                            
+                            cc |= (density_data[m100] <= 0) << 1;
+                            cc |= (density_data[m010] <= 0) << 2;
+                            cc |= (density_data[m110] <= 0) << 3;
+                            cc |= (density_data[m001] <= 0) << 4;
+                            cc |= (density_data[m101] <= 0) << 5;
+                            cc |= (density_data[m011] <= 0) << 6;
+                            cc |= (density_data[m111] <= 0) << 7;
+                            
+                            corner_cases[vidx] = cc;
+                            bool isActive = (cc != 0) && (cc != 255);
+                            if(isActive)
+                            {
+                                active_mask |= (1u << vidx);
+                                active_count++;
+                            }
+                        }
+                        else
+                        {
+                            // Boundary voxel - check each neighbor
+                            bool hasUnder0 = sign0, hasOver0 = !sign0;
+                            
+                            if(voxelPos[0] < size - 1)
+                            {
+                                bool s = density_data[morton_inc_x(morton)] <= 0;
+                                hasUnder0 |= s; hasOver0 |= !s;
+                                cc |= (s << 1);
+                            }
+                            if(voxelPos[1] < size - 1)
+                            {
+                                uint32_t m010 = morton_inc_y(morton);
+                                bool s = density_data[m010] <= 0;
+                                hasUnder0 |= s; hasOver0 |= !s;
+                                cc |= (s << 2);
+                                
+                                if(voxelPos[0] < size - 1)
+                                {
+                                    s = density_data[morton_inc_x(m010)] <= 0;
+                                    hasUnder0 |= s; hasOver0 |= !s;
+                                    cc |= (s << 3);
+                                }
+                            }
+                            if(voxelPos[2] < size - 1)
+                            {
+                                uint32_t m001 = morton_inc_z(morton);
+                                bool s = density_data[m001] <= 0;
+                                hasUnder0 |= s; hasOver0 |= !s;
+                                cc |= (s << 4);
+                                
+                                if(voxelPos[0] < size - 1)
+                                {
+                                    s = density_data[morton_inc_x(m001)] <= 0;
+                                    hasUnder0 |= s; hasOver0 |= !s;
+                                    cc |= (s << 5);
+                                }
+                                if(voxelPos[1] < size - 1)
+                                {
+                                    uint32_t m011 = morton_inc_y(m001);
+                                    s = density_data[m011] <= 0;
+                                    hasUnder0 |= s; hasOver0 |= !s;
+                                    cc |= (s << 6);
+                                    
+                                    if(voxelPos[0] < size - 1)
+                                    {
+                                        s = density_data[morton_inc_x(m011)] <= 0;
+                                        hasUnder0 |= s; hasOver0 |= !s;
+                                        cc |= (s << 7);
+                                    }
+                                }
+                            }
+                            
+                            corner_cases[vidx] = cc;
+                            bool isActive = hasUnder0 && hasOver0;
+                            if(isActive)
+                            {
+                                active_mask |= (1u << vidx);
+                                active_count++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Warp-level reduction: sum active counts across warp
+    uint32_t warp_total = active_count;
+    #pragma unroll
+    for(int offset = 16; offset > 0; offset >>= 1)
+        warp_total += __shfl_xor_sync(0xFFFFFFFF, warp_total, offset);
+    
+    // Exclusive prefix sum within warp
+    uint32_t warp_offset = active_count;
+    #pragma unroll
+    for(int offset = 1; offset < 32; offset <<= 1)
+    {
+        uint32_t n = __shfl_up_sync(0xFFFFFFFF, warp_offset, offset);
+        if(laneId >= offset) warp_offset += n;
+    }
+    warp_offset -= active_count;  // Convert to exclusive
+    
+    // Store warp total in shared memory
+    if(laneId == 31) temp[warpId] = warp_total;
+    __syncthreads();
+    
+    // First warp computes prefix sum of warp totals
+    if(warpId == 0)
+    {
+        uint32_t warpPrefixSum = (laneId < blockDim.x/32) ? temp[laneId] : 0;
+        #pragma unroll
+        for(int offset = 1; offset < 32; offset <<= 1)
+        {
+            uint32_t n = __shfl_up_sync(0xFFFFFFFF, warpPrefixSum, offset);
+            if(laneId >= offset) warpPrefixSum += n;
+        }
+        temp[laneId] = warpPrefixSum;
+    }
+    __syncthreads();
+    
+    // Get block offset from atomic add
+    if(threadIdx.x == blockDim.x - 1)
+        temp[32] = atomicAdd(&active_data->active_voxel_n, temp[blockDim.x/32 - 1]);
+    __syncthreads();
+    
+    // Compute final write position
+    uint32_t block_offset = temp[32];
+    uint32_t warp_base = (warpId > 0) ? temp[warpId - 1] : 0;
+    uint32_t writeIdx = block_offset + warp_base + warp_offset;
+    
+    // Write active voxels
+    for(int v = 0; v < 8; v++)
+    {
+        if(active_mask & (1u << v))
+        {
+            active_data->data[writeIdx].morton = mortons[v];
+            active_data->data[writeIdx].corner_case = corner_cases[v];
+            active_index_map[mortons[v]] = writeIdx;
+            writeIdx++;
+        }
+    }
 }
 
 } // namespace cuda_dc

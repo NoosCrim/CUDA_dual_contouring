@@ -2,6 +2,48 @@
 #include "cuda_dc/types.hpp"
 
 namespace cuda_dc{
+
+// Fast Morton code increment functions - avoid expensive to_morton() for neighbors
+// X bits are at positions 0, 3, 6, 9, ... (mask = 0x49249249)
+__device__ __forceinline__ uint32_t morton_inc_x(uint32_t m) {
+    constexpr uint32_t x_mask = 0x49249249u;
+    uint32_t x_sum = (m | ~x_mask) + 1;
+    return (x_sum & x_mask) | (m & ~x_mask);
+}
+
+// Y bits are at positions 1, 4, 7, 10, ... (mask = 0x92492492)
+__device__ __forceinline__ uint32_t morton_inc_y(uint32_t m) {
+    constexpr uint32_t y_mask = 0x92492492u;
+    uint32_t y_sum = (m | ~y_mask) + 2;
+    return (y_sum & y_mask) | (m & ~y_mask);
+}
+
+// Z bits are at positions 2, 5, 8, 11, ... (mask = 0x24924924)
+__device__ __forceinline__ uint32_t morton_inc_z(uint32_t m) {
+    constexpr uint32_t z_mask = 0x24924924u;
+    uint32_t z_sum = (m | ~z_mask) + 4;
+    return (z_sum & z_mask) | (m & ~z_mask);
+}
+
+// Morton decrement functions for -1 offsets
+__device__ __forceinline__ uint32_t morton_dec_x(uint32_t m) {
+    constexpr uint32_t x_mask = 0x49249249u;
+    uint32_t x_diff = (m & x_mask) - 1;
+    return (x_diff & x_mask) | (m & ~x_mask);
+}
+
+__device__ __forceinline__ uint32_t morton_dec_y(uint32_t m) {
+    constexpr uint32_t y_mask = 0x92492492u;
+    uint32_t y_diff = (m & y_mask) - 2;
+    return (y_diff & y_mask) | (m & ~y_mask);
+}
+
+__device__ __forceinline__ uint32_t morton_dec_z(uint32_t m) {
+    constexpr uint32_t z_mask = 0x24924924u;
+    uint32_t z_diff = (m & z_mask) - 4;
+    return (z_diff & z_mask) | (m & ~z_mask);
+}
+
 // stage 1 kernel calculating density values from a given function
 // 
 // calculates densities for voxel from formula "offset + scale * ID / size"
@@ -131,7 +173,7 @@ __global__ void gen_hermite_data(uint32_t size, float voxel_size, density_t* den
         // Edge 0: X-direction edge, quad needs voxels at Y-1 and Z-1
         if((edge_case & (1u << 0)) && voxelID[0] < (size - 1))
         {
-            samples[1] = density_data[to_morton(voxelID + vec_t<uint32_t, 3>{1,0,0})];
+            samples[1] = density_data[morton_inc_x(morton)];
             samples[1] = (samples[1] < 0) ? -(samples[1]) : samples[1];
             point = ref_point + vec3_t{voxel_size * samples[0]/(samples[0] + samples[1]), 0, 0};
             // Gradient functor expects normalized <0,1> coordinates
@@ -145,7 +187,7 @@ __global__ void gen_hermite_data(uint32_t size, float voxel_size, density_t* den
         // Edge 1: Y-direction edge, quad needs voxels at X-1 and Z-1
         if((edge_case & (1u << 1)) && voxelID[1] < (size - 1))
         {
-            samples[2] = density_data[to_morton(voxelID + vec_t<uint32_t, 3>{0,1,0})];
+            samples[2] = density_data[morton_inc_y(morton)];
             samples[2] = (samples[2] < 0) ? -(samples[2]) : samples[2];
             point = ref_point + vec3_t{0, voxel_size * samples[0]/(samples[0] + samples[2]), 0};
             // Gradient functor expects normalized <0,1> coordinates
@@ -159,7 +201,7 @@ __global__ void gen_hermite_data(uint32_t size, float voxel_size, density_t* den
         // Edge 2: Z-direction edge, quad needs voxels at X-1 and Y-1
         if((edge_case & (1u << 2)) && voxelID[2] < (size - 1))
         {
-            samples[3] = density_data[to_morton(voxelID + vec_t<uint32_t, 3>{0,0,1})];
+            samples[3] = density_data[morton_inc_z(morton)];
             samples[3] = (samples[3] < 0) ? -(samples[3]) : samples[3];
             point = ref_point + vec3_t{0, 0, voxel_size * samples[0]/(samples[0] + samples[3])};
             // Gradient functor expects normalized <0,1> coordinates
@@ -335,11 +377,16 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
     checkCudaErrors(cudaMalloc(&active_voxels_device, sizeof(ActiveData) + sizeof(ActiveVoxel) * grid_size_cubed));
     checkCudaErrors(cudaMemset(active_voxels_device, 0, sizeof(ActiveData)));  // Initialize counters to 0
     checkCudaErrors(cudaMalloc(&active_index_map, sizeof(uint32_t) * grid_size_cubed));
+    
+    // Thread coarsening: each thread processes a 2x2x2 block of voxels
+    // So we need (grid_size/2)^3 threads instead of grid_size^3
+    uint32_t half_grid = grid_size / 2;
+    uint32_t half_grid_cubed = half_grid * half_grid * half_grid;
     unsigned long long num_threads_2 = 256;
-    unsigned long long num_blocks_2 = (grid_size_cubed + num_threads_2 - 1) / num_threads_2;
+    unsigned long long num_blocks_2 = (half_grid_cubed + num_threads_2 - 1) / num_threads_2;
     unsigned long long shared_mem_size = 33*sizeof(uint32_t);
 
-    printf("\nLaunching active data kernel: %d blocks, %d threads\n", num_blocks_2, num_threads_2);
+    printf("\nLaunching active data kernel: %llu blocks, %llu threads (processing %u voxels in 2x2x2 blocks)\n", num_blocks_2, num_threads_2, grid_size_cubed);
     cudaEventRecord(start);
 
     gen_active_data<<<num_blocks_2, num_threads_2, shared_mem_size>>>(grid_size, density_data_device, active_voxels_device, active_index_map);
@@ -370,7 +417,7 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
     unsigned long long num_threads_3 = 512;
     unsigned long long num_blocks_3 = (active_voxels_host.active_voxel_n + num_threads_3 - 1) / num_threads_3;
     if(num_blocks_3 == 0) num_blocks_3 = 1;
-    // Shared memory: 33 words (same as gen_active_data)
+
     unsigned long long shared_mem_size_3 = 33 * sizeof(uint32_t);
     printf("\nLaunching gradient kernel: %llu blocks, %llu threads\n", num_blocks_3, num_threads_3);
     
@@ -439,7 +486,7 @@ Mesh RunDualContouring(F1 density_functor, F2 gradient_functor, uint32_t grid_si
     printf("Mesh kernel execution time: %f ms\n", milli);
 
     puts("\nMesh generation successful!\n\n");
-    printf("Total compute time: %f ms\n\n", milli_total);
+    printf("Total execution time: %f ms\n\n", milli_total);
     Mesh outMesh{vertexCount, indexCount};
     checkCudaErrors(cudaMemcpy(outMesh.verts, verts_device, vertexCount * sizeof(vert_t), cudaMemcpyDeviceToHost));
     checkCudaErrors(cudaMemcpy(outMesh.indices, idxs_device, indexCount * sizeof(uint32_t), cudaMemcpyDeviceToHost));
